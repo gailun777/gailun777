@@ -1,19 +1,21 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { calcSpreadBps, canOpenWith1UMargin } from '../server/index.js';
 
-test('effective fee with 80% rebate', ()=>{
-  const raw = 0.001;
-  const rebateRate = 0.8;
-  const effective = raw * (1 - rebateRate);
-  assert.ok(Math.abs(effective - 0.0002) < 1e-12);
+test('calc spread bps', ()=>{
+  const bps = calcSpreadBps(100, 100.1);
+  assert.ok(bps > 9.9 && bps < 10.1);
 });
 
-test('net profit rejects non-positive', ()=>{
-  const priceEdge = 0.001;
-  const effectiveFee = 0.0008;
-  const slippage = 0.0002;
-  const spread = 0.0002;
-  const funding = 0.0001;
-  const net = priceEdge - effectiveFee - slippage - spread - funding;
-  assert.ok(net <= 0);
+test('1U margin * 20x can open when min notional low enough', ()=>{
+  const contract = { order_size_min: 1, quanto_multiplier: 0.001 };
+  const out = canOpenWith1UMargin(contract, 10000, 20);
+  assert.equal(out.canOpen, true);
+  assert.equal(out.minNotional, 10);
+});
+
+test('1U margin * 20x cannot open when min notional too high', ()=>{
+  const contract = { order_size_min: 10, quanto_multiplier: 0.01 };
+  const out = canOpenWith1UMargin(contract, 1000, 20);
+  assert.equal(out.canOpen, false);
 });

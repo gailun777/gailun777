@@ -1,137 +1,201 @@
 import http from 'node:http';
 import { URL } from 'node:url';
+import { readFile } from 'node:fs/promises';
 
 const config = {
   mode: process.env.TRADING_MODE || 'paper',
-  rebateRate: 0.8,
-  makerFee: 0.0002,
-  takerFee: 0.0005,
-  slippageBps: 2,
-  spreadBps: 1.5,
-  maxLeverage: 20,
-  riskThreshold: 55
+  maxLeverageCheck: 20,
+  minQuoteVolumeUSDT: Number(process.env.MIN_QUOTE_VOL || 5_000_000),
+  maxSpreadBps: Number(process.env.MAX_SPREAD_BPS || 5),
+  minDepthNotionalUSDT: Number(process.env.MIN_DEPTH_NOTIONAL || 50_000)
 };
 
-const symbols = ['BTC_USDT','ETH_USDT','SOL_USDT','BNB_USDT','XRP_USDT','DOGE_USDT'];
 const state = {
   killSwitch: false,
-  equity: 10,
-  marginUsed: 0,
-  consecutiveLosses: 0,
-  pnlToday: 0,
-  positions: [],
   tradeLogs: [],
   riskLogs: []
 };
 
-function r(min, max){ return Math.random()*(max-min)+min; }
-function pick(arr){ return arr[Math.floor(Math.random()*arr.length)]; }
+const GATE_API = 'https://api.gateio.ws/api/v4';
 
-function scanSymbol(symbol){
-  const price = Number(r(symbol.includes('BTC')?60000: symbol.includes('ETH')?2500:0.08, symbol.includes('BTC')?70000: symbol.includes('ETH')?3200:300).toFixed(4));
-  const volumeScore = r(40,95);
-  const depthScore = r(35,95);
-  const spreadBps = r(0.5,8);
-  const slippageBps = r(0.5,10);
-  const fundingRate = r(-0.0006,0.0008);
+export function calcSpreadBps(bestBid, bestAsk) {
+  if (!bestBid || !bestAsk || bestBid <= 0 || bestAsk <= 0) return Infinity;
+  const mid = (bestBid + bestAsk) / 2;
+  return ((bestAsk - bestBid) / mid) * 10_000;
+}
 
-  const trend15m = pick(['up','down','sideways']);
-  const structure5m = pick(['breakout','pullback','support_resistance','weak']);
-  const entry1m = pick(['long','short','wait']);
-
-  const fakeSignal = spreadBps > 6 || slippageBps > 8 || structure5m === 'weak';
-
-  const strategy = trend15m === 'sideways' ? 'maker_hft' : (structure5m === 'breakout' ? 'trend_breakout' : 'pullback_rebound');
-
-  const direction = trend15m === 'up' ? 'long' : trend15m === 'down' ? 'short' : (entry1m === 'wait' ? 'wait' : entry1m);
-  const rawFee = config.takerFee * 2;
-  const effectiveFee = rawFee * (1 - config.rebateRate);
-  const edge = r(-0.001,0.004);
-  const spreadCost = spreadBps / 10000;
-  const slipCost = slippageBps / 10000;
-  const fundingCost = Math.max(0, fundingRate);
-  const net = edge - effectiveFee - spreadCost - slipCost - fundingCost;
-
-  const margin = Math.max(1, Number((state.equity * 0.1).toFixed(2)));
-  const leverages = [1,2,3,5,10,20].map(l => ({ leverage:l, canOpen: margin*l >= 5 }));
-  const minNotional = 5;
-  const firstAllowed = leverages.find(x=>x.canOpen)?.leverage ?? null;
-
-  const riskLevel = net <= 0 || fakeSignal ? 'red' : (net < 0.0008 ? 'yellow' : 'green');
-  const pool = volumeScore > 60 && depthScore > 60 && spreadBps < 4 && slippageBps < 5 && !fakeSignal && net > 0;
-
+export function canOpenWith1UMargin(contractMeta, lastPrice, leverage = 20) {
+  const orderSizeMin = Number(contractMeta.order_size_min || 0);
+  const quantoMultiplier = Number(contractMeta.quanto_multiplier || contractMeta.quanto_multiplier_float || 0);
+  if (!orderSizeMin || !quantoMultiplier || !lastPrice || leverage <= 0) {
+    return { canOpen: false, reason: 'missing_contract_specs' };
+  }
+  const minNotional = orderSizeMin * quantoMultiplier * lastPrice;
+  const notionalWith1U = 1 * leverage;
   return {
-    symbol,price,minNotional,neededLeverage:firstAllowed,leverages,
-    trend15m,structure5m,entry1m,strategy,fakeSignal,
-    netExpected:Number(net.toFixed(6)),riskLevel,
-    recommendPool:pool,
-    costs:{rawFee,effectiveFee,spreadCost,slipCost,fundingCost},
-    reason: pool ? 'liquid + net positive' : 'risk/cost filter blocked'
+    canOpen: notionalWith1U >= minNotional,
+    minNotional,
+    notionalWith1U,
+    leverageChecked: leverage
   };
 }
 
-function runScan(){
-  const rows = symbols.map(scanSymbol);
+export function pickRiskLevel({ spreadBps, quoteVolume, depthNotional, fundingRate, canOpenWith1U20x }) {
+  if (!canOpenWith1U20x || spreadBps > 10 || depthNotional < config.minDepthNotionalUSDT / 2) return 'red';
+  if (Math.abs(fundingRate) > 0.001 || spreadBps > config.maxSpreadBps || quoteVolume < config.minQuoteVolumeUSDT) return 'yellow';
+  return 'green';
+}
+
+async function gateGet(path) {
+  const resp = await fetch(`${GATE_API}${path}`);
+  if (!resp.ok) {
+    throw new Error(`gate_api_error ${resp.status} ${path}`);
+  }
+  return resp.json();
+}
+
+async function fetchGateMarketRows() {
+  const [contracts, tickers, orderBooks] = await Promise.all([
+    gateGet('/futures/usdt/contracts'),
+    gateGet('/futures/usdt/tickers'),
+    gateGet('/futures/usdt/order_book?contract=BTC_USDT&limit=20') // warmup/health check endpoint behavior
+      .then(() => null)
+      .catch(() => null)
+  ]);
+
+  const tickerMap = new Map(tickers.map(t => [t.contract, t]));
+
+  const usdtContracts = contracts.filter(c => !String(c.name || '').includes('_TEST'));
+  const selectedContracts = usdtContracts.slice(0, 60); // protect response time
+
+  const bookData = await Promise.all(
+    selectedContracts.map(async c => {
+      try {
+        const ob = await gateGet(`/futures/usdt/order_book?contract=${encodeURIComponent(c.name)}&limit=20`);
+        return [c.name, ob];
+      } catch {
+        return [c.name, null];
+      }
+    })
+  );
+  const bookMap = new Map(bookData);
+
+  const rows = selectedContracts
+    .map(c => {
+      const t = tickerMap.get(c.name);
+      if (!t) return null;
+
+      const lastPrice = Number(t.last);
+      const quoteVolume = Number(t.volume_24h_quote || t.volume_24h || 0);
+      const fundingRate = Number(t.funding_rate || 0);
+      const maxLeverage = Number(c.leverage_max || 0);
+      const orderSizeMin = Number(c.order_size_min || 0);
+      const quantoMultiplier = Number(c.quanto_multiplier || c.quanto_multiplier_float || 0);
+
+      const ob = bookMap.get(c.name);
+      const bestAsk = Number(ob?.asks?.[0]?.p || ob?.asks?.[0]?.[0] || 0);
+      const bestBid = Number(ob?.bids?.[0]?.p || ob?.bids?.[0]?.[0] || 0);
+      const spreadBps = calcSpreadBps(bestBid, bestAsk);
+
+      const bidDepth = (ob?.bids || []).reduce((sum, b) => sum + Number(b.s || b[1] || 0), 0);
+      const askDepth = (ob?.asks || []).reduce((sum, a) => sum + Number(a.s || a[1] || 0), 0);
+      const depthNotional = (bidDepth + askDepth) * lastPrice * quantoMultiplier;
+
+      const openCheck = canOpenWith1UMargin(c, lastPrice, config.maxLeverageCheck);
+      const riskLevel = pickRiskLevel({
+        spreadBps,
+        quoteVolume,
+        depthNotional,
+        fundingRate,
+        canOpenWith1U20x: openCheck.canOpen
+      });
+
+      const inPool =
+        quoteVolume >= config.minQuoteVolumeUSDT &&
+        spreadBps <= config.maxSpreadBps &&
+        depthNotional >= config.minDepthNotionalUSDT &&
+        openCheck.canOpen;
+
+      return {
+        symbol: c.name,
+        price: lastPrice,
+        volume24hQuote: quoteVolume,
+        fundingRate,
+        orderSizeMin,
+        contractMultiplier: quantoMultiplier,
+        maxLeverage,
+        bestBid,
+        bestAsk,
+        spreadBps: Number(spreadBps.toFixed(2)),
+        depthNotionalUSDT: Number(depthNotional.toFixed(2)),
+        openWith1U20x: openCheck.canOpen,
+        minNotional: Number((openCheck.minNotional || 0).toFixed(4)),
+        notionalWith1U20x: openCheck.notionalWith1U || 20,
+        riskLevel,
+        recommendPool: inPool
+      };
+    })
+    .filter(Boolean)
+    .sort((a, b) => b.volume24hQuote - a.volume24hQuote)
+    .filter(r => r.recommendPool);
+
+  return rows;
+}
+
+async function runScan() {
+  const rows = await fetchGateMarketRows();
   return {
     mode: config.mode,
     killSwitch: state.killSwitch,
-    equity: state.equity,
-    marginUsed: state.marginUsed,
-    pnlToday: state.pnlToday,
-    consecutiveLosses: state.consecutiveLosses,
-    rebateRate: config.rebateRate,
     rows,
-    ts: new Date().toISOString()
+    ts: new Date().toISOString(),
+    source: 'gate_public_api',
+    liveTradingEnabled: false
   };
 }
 
-function maybeAutoTrade(scan){
-  if (config.mode !== 'paper' || state.killSwitch) return;
-  for (const row of scan.rows) {
-    if (row.riskLevel !== 'green' || !row.recommendPool) continue;
-    if (state.consecutiveLosses >= 3 || state.pnlToday <= -0.3) break;
-    const side = row.trend15m === 'down' ? 'short' : 'long';
-    const margin = Math.max(1, Number((state.equity * 0.1).toFixed(2)));
-    const leverage = Math.min(row.neededLeverage || 1, config.maxLeverage);
-    const pnl = Number(r(-0.08, 0.12).toFixed(3));
-    state.pnlToday += pnl;
-    state.equity = Number((state.equity + pnl).toFixed(3));
-    state.consecutiveLosses = pnl < 0 ? state.consecutiveLosses + 1 : 0;
-    state.tradeLogs.unshift({ ts: new Date().toISOString(), symbol: row.symbol, side, leverage, margin, pnl, strategy: row.strategy });
-    if (state.tradeLogs.length > 200) state.tradeLogs.pop();
-    state.riskLogs.unshift({ ts: new Date().toISOString(), symbol: row.symbol, status: 'green_auto_executed', netExpected: row.netExpected });
-  }
-}
-
-const server = http.createServer((req, res) => {
+const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, `http://${req.headers.host}`);
+
   if (url.pathname === '/api/scan') {
-    const scan = runScan();
-    maybeAutoTrade(scan);
-    res.setHeader('content-type', 'application/json');
-    res.end(JSON.stringify({ ...scan, tradeLogs: state.tradeLogs.slice(0,50), riskLogs: state.riskLogs.slice(0,50), positions: state.positions }));
+    try {
+      const scan = await runScan();
+      res.setHeader('content-type', 'application/json');
+      res.end(JSON.stringify({ ...scan, tradeLogs: state.tradeLogs, riskLogs: state.riskLogs }));
+    } catch (err) {
+      res.statusCode = 500;
+      res.setHeader('content-type', 'application/json');
+      res.end(JSON.stringify({ error: 'scan_failed', detail: String(err.message || err) }));
+    }
     return;
   }
+
   if (url.pathname === '/api/kill-switch' && req.method === 'POST') {
     state.killSwitch = !state.killSwitch;
     res.setHeader('content-type', 'application/json');
     res.end(JSON.stringify({ killSwitch: state.killSwitch }));
     return;
   }
+
   const file = url.pathname === '/' ? '/index.html' : url.pathname;
-  if (file === '/index.html' || file === '/app.js' || file === '/style.css') {
-    import('node:fs').then(fs => {
-      fs.readFile(new URL(`../public${file}`, import.meta.url), (err, data) => {
-        if (err) { res.statusCode = 404; res.end('Not found'); return; }
-        if (file.endsWith('.js')) res.setHeader('content-type','text/javascript');
-        if (file.endsWith('.css')) res.setHeader('content-type','text/css');
-        res.end(data);
-      });
-    });
+  if (['/index.html', '/app.js', '/style.css'].includes(file)) {
+    try {
+      const data = await readFile(new URL(`../public${file}`, import.meta.url));
+      if (file.endsWith('.js')) res.setHeader('content-type', 'text/javascript');
+      if (file.endsWith('.css')) res.setHeader('content-type', 'text/css');
+      res.end(data);
+    } catch {
+      res.statusCode = 404;
+      res.end('Not found');
+    }
     return;
   }
+
   res.statusCode = 404;
   res.end('Not found');
 });
 
-server.listen(3000, () => console.log('server on http://localhost:3000'));
+if (import.meta.url === `file://${process.argv[1]}`) {
+  server.listen(3000, () => console.log('server on http://localhost:3000'));
+}
+

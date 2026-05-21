@@ -1,0 +1,7 @@
+body{font-family:Arial,sans-serif;background:#0b1220;color:#e8f0ff;margin:0;padding:10px}
+header{display:flex;justify-content:space-between;align-items:center}
+button{font-size:18px;padding:10px 14px;border-radius:10px}
+table{width:100%;font-size:12px;border-collapse:collapse}
+th,td{border:1px solid #2b3550;padding:6px}
+.green{color:#46e08f}.yellow{color:#ffd24d}.red{color:#ff6a6a}
+pre{white-space:pre-wrap;background:#121a2d;padding:8px;border-radius:8px;max-height:180px;overflow:auto}
